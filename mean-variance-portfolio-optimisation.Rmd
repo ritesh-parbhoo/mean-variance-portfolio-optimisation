@@ -1,0 +1,495 @@
+---
+title: "Mean Variance Portfolio Optimisation"
+author: "Ritesh Parbhoo"
+date: "2026-02-06"
+output:
+  pdf_document: default
+---
+
+### Email: riteshparbhoo@outlook.com
+### GitHub: https://github.com/ritesh-parbhoo/
+
+```{r, include=FALSE}
+packages <- c("quantmod", "PerformanceAnalytics", "quadprog", "MASS", "ggplot2", "knitr")
+for (pkg in packages) {
+  if (!requireNamespace(pkg, quietly = TRUE)) install.packages(pkg)
+}
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+options(max.print = 10000)
+```
+
+# Project Overview
+## Project Description
+This project explores portfolio optimisation and risk analysis using historical asset prices. It begins by collecting historical daily price data, computing daily returns, and annualising them to derive the mean returns vector and covariance of returns matrix. Using these inputs, an efficient frontier is plotted to determine efficient portfolio weight combinations. A Monte Carlo simulation is employed to generate potential asset returns scenarios, assuming asset returns follow a multivariate normal distribution, leading to the calculation of risk measures such as Value at Risk (VaR) and Expected Shortfall (ES). Efficient portfolios are then compared across these risk measures, offering an integrated assessment of efficiency and risk-adjusted performance. Statistical analysis, optimisation techniques, and simulation-based risk evaluation are implemented to demonstrate practical applications of mean-variance portfolio theory.
+
+```{r, message=FALSE}
+library(quantmod)
+library(PerformanceAnalytics)
+library(quadprog)
+library(MASS)
+library(ggplot2)
+library(knitr)
+```
+
+# Data Overview
+
+A set of five assets (AAPL, XOM, GLD, TLT, WMT) were selected to construct a portfolio across distinct economic sectors, asset classes and risk factor exposures, enhancing diversification within the Mean-Variance Portfolio Theory (MVPT) framework.
+
+```{r, echo=FALSE}
+tickers <- c(
+  "AAPL",
+  "XOM",
+  "GLD",
+  "TLT",
+  "WMT"
+)
+kable(matrix(c(
+  "Apple Inc.", "Exxon Mobil Corporation", "Gold Futures", "20-Yr Treasury Bond ETF", "Walmart Inc."
+), ncol=1, dimnames = list(tickers, c(""))))
+```
+
+## Historical Prices
+
+Historical daily prices for each of the assets are stored as a time series object (xts) in R, and any missing values have been omitted. Daily prices from 01/01/2020 to 06/02/2026 are considered.
+
+```{r, include=FALSE}
+closing_prices_df <-
+  function(symbols,
+           start_date = '2020-01-01',
+           end_date = '2026-02-06',
+           source = 'yahoo') {
+    closing_prices <- list()
+    
+    for (s in symbols) {
+      data <- getSymbols(
+        Symbols = s,
+        src = source,
+        from = start_date,
+        to = end_date,
+        auto.assign = FALSE
+      )
+      closing_prices[[s]] <- Ad(data) # use adjusted close
+    }
+    prices_xts <-
+      do.call(merge, closing_prices)  # keep xts with dates
+    return(prices_xts)
+    
+  }
+
+N <- length(tickers)
+prices_xts <- closing_prices_df(tickers)
+prices_xts <- na.omit(prices_xts)
+colnames(prices_xts) <- tickers
+
+```
+
+### Historical Prices Data:
+The first few rows are displayed to aid in understanding the daily prices data.
+```{r, echo=FALSE}
+head(prices_xts)
+```
+
+### Historical Prices Summary Statistics:
+Quartiles are reported to exhibit the skewness of the daily prices data.
+```{r, echo=FALSE}
+kable(summary(coredata(prices_xts)))
+```
+
+## Historical Returns
+
+From historical daily prices, historical daily returns are simply computed. These returns are then annualised by assuming 252 trading days per annum, and a mean annual returns vector and a covariance of annual returns matrix are produced.
+
+```{r, include=FALSE}
+returns_xts <- Return.calculate(prices_xts, method = "discrete")
+returns_xts <- na.omit(returns_xts)
+```
+
+### Historical Returns Data:
+The first few rows are displayed to aid in understanding of the daily returns data.
+```{r, echo=FALSE}
+head(returns_xts)
+```
+
+### Historical Returns Summary Statistics:
+Quartiles are reported to exhibit the skewness of the daily returns data.
+```{r, echo=FALSE}
+kable(summary(coredata(returns_xts)))
+```
+
+### Mean Annual Returns Vector (Mu)
+
+```{r, echo=FALSE}
+trading_days = 252
+
+mu_daily <- colMeans(returns_xts)
+mu_annual <- mu_daily * trading_days
+
+kable(matrix(mu_annual, ncol=1, dimnames=list(tickers, c(""))))
+```
+
+### Covariance of Annual Returns Matrix (Sigma)
+
+```{r, echo=FALSE}
+cov_daily <- cov(returns_xts)
+cov_annual <- cov_daily * trading_days
+
+kable(cov_annual)
+```
+
+```{r, include=FALSE}
+cor_annual <- cor(returns_xts)
+```
+
+### Correlation of Returns Matrix
+
+```{r, include=FALSE}
+
+plot_transition_heatmap <- function(mat) {
+  
+  mat <- mat[c(rev(seq(dim(mat)[1]))),]
+
+  # Convert matrix to long format
+  mat_long <- as.data.frame.table(mat)
+  colnames(mat_long) <- c("Row", "Column", "Value")
+  
+  # Plot heatmap
+  ggplot(mat_long, aes(x = Column, y = Row, fill = Value)) +
+    geom_tile() +
+    geom_text(aes(label = round(Value, 5))) +
+    scale_fill_gradient(low = "green", high = "red") +
+    labs(title="Historical Asset Returns Correlation Matrix") +
+    theme_minimal() +
+    theme(axis.title = element_blank(),
+          axis.text = element_text(size = 10),
+          axis.text.x = element_text(angle=45, hjust=1))
+}
+
+```
+
+```{r, echo=FALSE}
+plot_transition_heatmap(cor_annual)
+```
+
+Among the assets, there is low correlation and in some cases negative correlation. This is desirable as it improves portfolio efficiency (reduces total volatility without necessarily reducing expected return).
+
+# Example Portfolio
+
+Using the mean annual returns vector, mu (mu_annual), and the covariance of annual returns matrix, sigma (cov_annual), the expected return and variance of any portfolio of the selected assets can be determined. This will be demonstrated with the equally-weighted porfolio (EW) for convenience - this portfolio has all positive weights, however it is assumed in general that short selling (negative weights) is allowed.
+
+```{r}
+ew <- rep(1/N, N)
+mu_ew <- ew%*%mu_annual
+var_ew <- ew%*%cov_annual%*%ew
+```
+
+```{r, echo=FALSE}
+paste("Expected Return (EW):", mu_ew)
+paste("Variance of Return (EW):", var_ew)
+pie(ew, labels=tickers, main = "Equally-Weighted Portfolio Weights")
+```
+
+# Efficient Frontier
+
+## Tracing the Efficient Frontier (Constrained Quadratic Optimisation)
+
+The efficient frontier is plotted by determining the minimum variance for every expected return value between the minimim and maximum expected returns found in the mean annual returns vector, mu, as these are the minimum and maximum expected returns achievable by any portfolio of the assets. The continuous line is discretised into fifty points and the minimum variance for each expected return is determined using constrained quadratic optimisation and the quadprog library. The curve generated is a hyperbola in Expected Return-Standard Deviation (E-sigma) space. By plotting randomly selected portfolios, it can be seen that the curve partitions the space into attainable but inefficient (right), and unattainable portfolios (left). The efficient frontier is the top arc of the hyperbola. 
+
+```{r, include=FALSE}
+n_mu_points = 50
+
+mu_seq <- seq(min(mu_annual), max(mu_annual), length.out = n_mu_points)
+
+frontier <- numeric(length(mu_seq))
+df <- data.frame()
+
+for (i in seq_along(mu_seq)) {
+  m_target <- mu_seq[i]
+  
+  # Constraints: sum(w) = 1, expected return = m_target
+  Amat <- cbind(rep(1, N), mu_annual)
+  bvec <- c(1, m_target)
+  meq <- 2
+  
+  sol <- solve.QP(
+    Dmat = 2 * cov_annual,
+    dvec = rep(0, N),
+    Amat = Amat,
+    bvec = bvec,
+    meq = meq
+  )
+  
+  # portfolio variance
+  var_port <- as.numeric(t(sol$solution) %*% cov_annual %*% sol$solution)
+  frontier[i] <- var_port
+  
+  # add row to dataframe: mu, sd, weights
+  df <- rbind(
+    df,
+    data.frame(
+      mu = m_target,
+      sd = sqrt(var_port),
+      t(sol$solution)
+    )
+  )
+}
+
+colnames(df)[-(1:2)] <- paste0("w", 1:N)
+
+```
+
+
+```{r, include=FALSE}
+plot_random_portfolios <- function(
+  n_portfolios,
+  mu,
+  cov_mat,
+  add = TRUE
+) {
+  
+  N <- length(mu)
+  
+  # Generate random weights
+  weights_mat <- matrix(NA, nrow = n_portfolios, ncol = N)
+  
+  for (i in 1:n_portfolios) {
+    # Random weights with short selling allowed
+    w <- rnorm(N)
+    
+    # Fully invested: normalize to sum to 1
+    w <- w / sum(w)
+    weights_mat[i, ] <- w
+  }
+  
+  # Portfolio returns and risk
+  port_returns <- as.vector(weights_mat %*% mu)
+  
+  port_vars <- apply(weights_mat, 1, function(w) {
+    as.numeric(t(w) %*% cov_mat %*% w)
+  })
+  
+  port_sd <- sqrt(port_vars)
+  
+  # Plotting
+  if (!add) {
+    plot(
+      port_sd,
+      port_returns,
+      xlab = "Portfolio Standard Deviation",
+      ylab = "Portfolio Expected Return",
+      main = "Random Portfolios"
+    )
+  } else {
+    points(
+      port_sd,
+      port_returns,
+      col = rgb(1, 0, 0, 0.4),
+      pch = 16
+    )
+  }
+  
+  invisible(
+    data.frame(
+      mu = port_returns,
+      sd = port_sd,
+      weights_mat
+    )
+  )
+}
+
+```
+
+
+
+```{r, echo=FALSE}
+# plot the efficient frontier
+plot(
+  sqrt(frontier),
+  mu_seq,
+  type = "l",
+  xlab = "Portfolio Standard Deviation",
+  ylab = "Portfolio Expected Return",
+  main = "Efficient Frontier with Random Portfolios"
+)
+
+# overlay random portfolios
+plot_random_portfolios(
+  n_portfolios = 15000,
+  mu = mu_annual,
+  cov_mat = cov_annual,
+  add = TRUE
+)
+
+```
+
+## Global Minimum Variance Portfolio (GMV)
+
+The weights of the GMV are given by C^(-1)1 / t(1)C^(-1)1, where C is the covariance of annual returns matrix, C^(-1) is its inverse and 1 is a vector of ones. C is necessarily positive semi-definite, however for it to be positive definite and hence necessarily invertible, its eigenvalues must be positive, which is the case here.
+
+### Eigenvalues of C (Sigma):
+```{r, echo=FALSE}
+eigenvalues <- eigen(cov_annual)$values
+kable(matrix(eigenvalues, dimnames = list(rep("", N), c("eigenvalues"))))
+```
+
+All of the eigenvalues of the covariance of annual returns matrix (C) are positive and hence C is positive definite and invertible.
+
+### GMV Portfolio Weights:
+
+```{r, echo=FALSE}
+gmv_weights <- as.numeric(solve(cov_annual)%*%rep(1, N))/as.numeric(rep(1, N) %*% solve(cov_annual) %*% rep(1, N))
+kable(matrix(gmv_weights, dimnames = list(tickers, c("weights"))))
+```
+
+### GMV Portfolio Mean and Variance:
+
+```{r, echo=FALSE}
+mu_gmv <- as.numeric(gmv_weights%*%mu_annual)
+var_gmv <- as.numeric(gmv_weights %*% cov_annual %*% gmv_weights)
+paste("GMV Expected Returns:", mu_gmv)
+paste("GMV Variance:", var_gmv)
+```
+
+## Efficient Portfolios
+
+Of the portfolios used in the discretised curve in Expected Return-Standard Deviation Space, only those that are in the upper arc of the curve are efficient. Thus only the portfolios whose expected return exceded the GMV portfolio's expected return are efficient. These efficient portfolios are stored in the dataframe, eff_ports. w_i is the weight corresponding to asset i.
+
+```{r, echo=FALSE}
+eff_ports <- df[df$mu >= as.numeric(mu_gmv),]
+kable(eff_ports, booktabs = TRUE, longtable = FALSE)
+```
+
+
+# Monte Carlo Simulation of Asset Returns
+
+Monte Carlo simulation is used to create random possible asset return scenarios for the five assets where the time horizon is one year. It is assumed that annual assets returns follow a multivariate normal distribution with the mean of annual returns vector and the covariance of annual returns matrix as parameters. 10000 such scenarios are generated, of which the first few are displayed.
+
+```{r, echo=FALSE}
+set.seed(100)
+n_sim <- 10000
+sim_asset_returns <- mvrnorm(n_sim, mu_annual, cov_annual)
+kable(head(sim_asset_returns))
+```
+
+Each of the five marginal distributions are univariate normal distributions and this can be seen by overlaying a theoretical normal distribution onto a histogram of the simulated returns for each asset. This is done for Asset 1, AAPL. 
+
+```{r, echo=F}
+hist(sim_asset_returns[,1], prob=T, main="Histogram of Simulated One-Year Asset Returns for Asset 1", xlab="Expected Return")
+x_vals <- seq(min(sim_asset_returns[,1]), max(sim_asset_returns[,1]), length=100)
+
+mean_sim1 <- mean(sim_asset_returns[,1])
+sd_sim1 <- sd(sim_asset_returns[,1])
+
+# Add normal curve
+x_vals <- seq(min(sim_asset_returns[,1]), max(sim_asset_returns[,1]), length=100)
+lines(x_vals, dnorm(x_vals, mean = mean_sim1, sd = sd_sim1), col = "red", lwd = 2)
+```
+
+# Risk Measures
+
+Efficient portfolios can be compared using various risk measures. Volatility, Value at Risk (95%), and Expected Shortfall will be reported on the simulated returns and the efficient portfolios that outperform will be identified. 
+
+```{r, include=FALSE}
+# simulated portfolio returns are calculated from simulated asset returns 
+eff_port_weights <- as.matrix(eff_ports[, c("w1", "w2", "w3", "w4", "w5")])
+sim_port_returns <- eff_port_weights %*% t(sim_asset_returns)
+
+risk_measures <- data.frame(matrix(nrow=dim(eff_ports)[1], ncol=0))
+rownames(risk_measures) <- rownames(eff_ports)
+```
+
+## Volatility
+
+Volatility is the standard deviation of the simulated returns. As a risk measure it is easy to compute, however it captures fluctuations in both directions and does not capture extreme tail risk. Volatility should be prioritised when overall uncertainty is the biggest concern of the investor, in which case, the optimal portfolio would be the GMV portfolio.
+
+```{r, include=FALSE}
+risk_measures$Volatility <- apply(sim_port_returns, 1, FUN = sd)
+```
+
+Optimal Portfolio using Volatility
+
+```{r, echo=FALSE}
+cat("Portfolio: GMV Portfolio", "\n")
+cat("Weights:", gmv_weights, "\n")
+cat("Theoretical Mean:", mu_gmv, "\n")
+cat("Theoretical Variance:", var_gmv)
+```
+
+
+## Value at Risk (95%)
+
+Value at Risk (VaR) with a 95% confidence-level is the maximum potential loss over the time horizon with 95% confidence. VaR should be prioritised when the investor faces regulatory or short-term risk limits and the worst-case loss with a given level of confidence must be known. The portfolio that minimises VaR would be optimal.
+
+```{r, include=FALSE}
+conf_level <- 0.95
+risk_measures$VaR_95 <- apply(-sim_port_returns, 1, FUN = function(x) quantile(x, probs=conf_level))
+```
+
+Optimal Portfolio using VaR
+
+```{r, echo=FALSE}
+index_VaR_95_min <- which.min(risk_measures$VaR_95)
+rowname_VaR_95_min <- rownames(risk_measures)[index_VaR_95_min]
+weights_VaR_95_min <- eff_port_weights[rowname_VaR_95_min, ]
+cat("Portfolio:", rowname_VaR_95_min, "\n")
+cat("Weights:", weights_VaR_95_min, "\n")
+cat("Theoretical Mean:", weights_VaR_95_min %*% mu_annual, "\n")
+cat("Theoretical Variance:", weights_VaR_95_min %*% cov_annual %*% weights_VaR_95_min)
+```
+
+## Expected Shortfall
+
+Expected Shortfall (ES) is the average loss beyond the VaR threshold. ES is the standard risk measure for stress testing and tail risk management, and should be prioritised when the investor is concerned with extreme events beyond VaR. The portfolio that minimises ES would be optimal.
+
+
+```{r, include=FALSE}
+risk_measures$ES <- sapply(1:nrow(sim_port_returns), function(i) {
+  x <- -sim_port_returns[i, ]
+  VaR_i <- risk_measures$VaR_95[i]
+  mean(x[x >= VaR_i])   # mean of losses exceeding VaR
+})
+
+```
+
+Optimal Portfolio using ES
+
+```{r, echo=FALSE}
+index_ES_min <- which.min(risk_measures$ES)
+rowname_ES_min <- rownames(risk_measures)[index_ES_min]
+weights_ES_min <- eff_port_weights[rowname_ES_min, ]
+cat("Portfolio:", rowname_ES_min, "\n")
+cat("Weights:", weights_ES_min, "\n")
+cat("Theoretical Mean:", weights_ES_min %*% mu_annual, "\n")
+cat("Theoretical Variance:", weights_ES_min %*% cov_annual %*% weights_ES_min)
+```
+
+```{r, echo=FALSE}
+kable(risk_measures)
+```
+
+
+# Discussion
+
+The analysis shows how portfolio optimisation and risk evaluation can be integrated to inform investment decisions. Through computing historical returns and covariances, an efficient frontier was produced illustrating the tradeoff between expected return and volatility. Possible asset return scenarios were simulated using a Monte Carlo approach under the assumption of multivariate normality, on which the risk measures of volatility, value at risk, and expected shortfall were computed. 
+
+Considering the strengths and weakness of these risk measures and comparing them across efficient portfolios yielded important insights, such as that minimising volatility did not minimise tail risk. Portfolios selected on the basis of VaR or ES gave a clear perspective on potential extreme losses, which is important to risk-averse investors. 
+
+# Conclusion
+
+This project illustrates a practical application of mean-variance portfolio theory and simulation-based market risk analysis. Efficient frontier optimisation selects portfolios with optimal risk-return profiles. VaR and ES give valuable insights into tail risk. Overall, it was demonstrated that this integrated approach to market risk analysis can improve portfolio selection and promote a clearer understanding of practical applications in financial risk management.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
